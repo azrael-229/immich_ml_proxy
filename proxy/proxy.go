@@ -200,6 +200,15 @@ func GroupEntriesByType(entries []Entry) map[string][]Entry {
 	return grouped
 }
 
+// GroupEntriesByTask groups entries by their task name
+func GroupEntriesByTask(entries []Entry) map[string][]Entry {
+	grouped := make(map[string][]Entry)
+	for _, entry := range entries {
+		grouped[entry.Task] = append(grouped[entry.Task], entry)
+	}
+	return grouped
+}
+
 // BuildEntriesForType builds the entries JSON structure for a specific type
 func BuildEntriesForType(entries []Entry) (map[string]interface{}, error) {
 	result := make(map[string]interface{})

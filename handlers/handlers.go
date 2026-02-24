@@ -134,25 +134,26 @@ func PredictHandler(c *gin.Context) {
 		return
 	}
 
-// Group entries by type
-	groupedByType := proxy.GroupEntriesByType(entries)
+	// Group entries by task (e.g., "facial-recognition", "clip", "ocr")
+	// This ensures all sub-entries (detection + recognition) stay together
+	groupedByTask := proxy.GroupEntriesByTask(entries)
 
-	// For each type, build entries and forward to backend
-	typeResults := make(map[string]interface{})
-	typeErrors := make(map[string]error)
+	// For each task, build entries and forward to backend
+	taskResults := make(map[string]interface{})
+	taskErrors := make(map[string]error)
 	var resultMutex sync.Mutex
 	var wg sync.WaitGroup
 
-	for typeName, typeEntries := range groupedByType {
+	for taskName, taskEntries := range groupedByTask {
 		wg.Add(1)
 		go func(t string, te []proxy.Entry) {
 			defer wg.Done()
 
-			// Build entries for this type
-			entriesForType, err := proxy.BuildEntriesForType(te)
+			// Build entries for this task (keeps all sub-types together)
+			entriesForTask, err := proxy.BuildEntriesForTask(te)
 			if err != nil {
 				resultMutex.Lock()
-				typeErrors[t] = err
+				taskErrors[t] = err
 				resultMutex.Unlock()
 				return
 			}
@@ -170,38 +171,33 @@ func PredictHandler(c *gin.Context) {
 
 			// Step 2: If no modelType-specific backend found, try task-based routing
 			if selectedBackend == nil {
-				// Get the task name from entries (all entries in this group have the same type but may have different tasks)
-				// We use the first entry's task for routing
-				if len(te) > 0 {
-					taskName := te[0].Task
-					// Check if this task has specific routing in taskRouting
-					healthyBackends := cfg.GetHealthyBackendsByType(taskName)
-					allBackends := cfg.GetBackendsByType(taskName)
+				// Check if this task has specific routing in taskRouting
+				healthyBackends := cfg.GetHealthyBackendsByType(t)
+				allBackends := cfg.GetBackendsByType(t)
 
-					if len(allBackends) > 0 {
-						// Use round-robin to select backend
-						var backendList []string
-						if len(healthyBackends) > 0 {
-							// Prefer healthy backends
-							for _, b := range healthyBackends {
-								backendList = append(backendList, b.URL)
-							}
-						} else {
-							// No healthy backends, use all backends
-							for _, b := range allBackends {
-								backendList = append(backendList, b.URL)
-							}
+				if len(allBackends) > 0 {
+					// Use round-robin to select backend
+					var backendList []string
+					if len(healthyBackends) > 0 {
+						// Prefer healthy backends
+						for _, b := range healthyBackends {
+							backendList = append(backendList, b.URL)
 						}
+					} else {
+						// No healthy backends, use all backends
+						for _, b := range allBackends {
+							backendList = append(backendList, b.URL)
+						}
+					}
 
-						// Use round-robin to select backend
-						selectedURL := proxy.GetNextBackend(taskName, backendList)
-						if selectedURL != "" {
-							// Find backend by URL
-							for _, b := range allBackends {
-								if b.URL == selectedURL {
-									selectedBackend = &b
-									break
-								}
+					// Use round-robin to select backend
+					selectedURL := proxy.GetNextBackend(t, backendList)
+					if selectedURL != "" {
+						// Find backend by URL
+						for _, b := range allBackends {
+							if b.URL == selectedURL {
+								selectedBackend = &b
+								break
 							}
 						}
 					}
@@ -219,22 +215,18 @@ func PredictHandler(c *gin.Context) {
 					}
 				}
 				if selectedBackend == nil {
-					taskName := ""
-					if len(te) > 0 {
-						taskName = te[0].Task
-					}
 					resultMutex.Lock()
-					typeErrors[t] = fmt.Errorf("no backend available for task: %s, type: %s", taskName, t)
+					taskErrors[t] = fmt.Errorf("no backend available for task: %s", t)
 					resultMutex.Unlock()
 					return
 				}
 			}
 
-			// Create request with entries for this type
-			entriesJSON, err := json.Marshal(entriesForType)
+			// Create request with entries for this task
+			entriesJSON, err := json.Marshal(entriesForTask)
 			if err != nil {
 				resultMutex.Lock()
-				typeErrors[t] = err
+				taskErrors[t] = err
 				resultMutex.Unlock()
 				return
 			}
@@ -253,7 +245,7 @@ func PredictHandler(c *gin.Context) {
 				cfg.SetHealthStatus(selectedBackend.Name, config.HealthStatusUnhealthy, err.Error())
 
 				resultMutex.Lock()
-				typeErrors[t] = err
+				taskErrors[t] = err
 				resultMutex.Unlock()
 				return
 			}
@@ -283,14 +275,14 @@ func PredictHandler(c *gin.Context) {
 			body, err := io.ReadAll(resp.Body)
 			if err != nil {
 				resultMutex.Lock()
-				typeErrors[t] = err
+				taskErrors[t] = err
 				resultMutex.Unlock()
 				return
 			}
 
 			if resp.StatusCode != http.StatusOK {
 				resultMutex.Lock()
-				typeErrors[t] = fmt.Errorf("backend returned status %d: %s", resp.StatusCode, string(body))
+				taskErrors[t] = fmt.Errorf("backend returned status %d: %s", resp.StatusCode, string(body))
 				resultMutex.Unlock()
 				return
 			}
@@ -299,42 +291,37 @@ func PredictHandler(c *gin.Context) {
 			var result map[string]interface{}
 			if err := json.Unmarshal(body, &result); err != nil {
 				resultMutex.Lock()
-				typeErrors[t] = err
+				taskErrors[t] = err
 				resultMutex.Unlock()
 				return
 			}
 
 			resultMutex.Lock()
-			typeResults[t] = result
+			taskResults[t] = result
 			resultMutex.Unlock()
-		}(typeName, typeEntries)
+		}(taskName, taskEntries)
 	}
 
 	wg.Wait()
 
 	// Check for errors
-	if len(typeErrors) > 0 {
+	if len(taskErrors) > 0 {
 		var errMsgs []string
-		for t, err := range typeErrors {
-			errMsgs = append(errMsgs, fmt.Sprintf("type %s: %v", t, err))
+		for t, err := range taskErrors {
+			errMsgs = append(errMsgs, fmt.Sprintf("task %s: %v", t, err))
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Failed to process some types",
+			"error":  "Failed to process some tasks",
 			"errors": errMsgs,
 		})
 		return
 	}
 
-	// Assemble results in original order
+	// Assemble results - merge all task results into final response
 	finalResult := make(map[string]interface{})
-	for _, entry := range entries {
-		typeResult, exists := typeResults[entry.Type]
-		if exists {
-			// typeResult is already in the format {"taskName": {...}}
-			// Merge it directly into finalResult
-			for key, value := range typeResult.(map[string]interface{}) {
-				finalResult[key] = value
-			}
+	for _, result := range taskResults {
+		for key, value := range result.(map[string]interface{}) {
+			finalResult[key] = value
 		}
 	}
 
