@@ -27,13 +27,15 @@ type BackendHealth struct {
 }
 
 type Config struct {
-		DefaultBackend   string            `json:"defaultBackend"`
-		Backends         []Backend         `json:"backends"`
-		TaskRouting      map[string]string `json:"taskRouting"` // task -> backend name mapping
-		ModelTypeRouting map[string]string `json:"modelTypeRouting"` // modelType -> backend name mapping (for clip: textual, visual)
-		Health           map[string]BackendHealth `json:"-"` // backend name -> health status
-		mu               sync.RWMutex
-	}
+	 DefaultBackend    string            `json:"defaultBackend"`
+     Backends          []Backend         `json:"backends"`
+     TaskRouting       map[string]string `json:"taskRouting"`
+	 ModelTypeFallback map[string]string `json:"modelTypeFallback"`
+     ModelTypeRouting  map[string]string `json:"modelTypeRouting"`
+     Health            map[string]BackendHealth `json:"-"`
+     mu               sync.RWMutex
+}
+
 var (
 	instance *Config
 	once     sync.Once
@@ -46,6 +48,7 @@ func Load() *Config {
 			DefaultBackend:   "",
 			Backends:         []Backend{},
 			TaskRouting:      make(map[string]string),
+			ModelTypeFallback:     make(map[string]string),
 			ModelTypeRouting: make(map[string]string),
 			Health:           make(map[string]BackendHealth),
 		}
@@ -72,6 +75,7 @@ func (c *Config) loadFromFile() {
 	c.DefaultBackend = cfg.DefaultBackend
 	c.Backends = cfg.Backends
 	c.TaskRouting = cfg.TaskRouting
+    c.ModelTypeFallback = cfg.ModelTypeFallback
 	c.ModelTypeRouting = cfg.ModelTypeRouting
 }
 
@@ -178,11 +182,13 @@ func (c *Config) ToJSON() ([]byte, error) {
 		DefaultBackend   string            `json:"defaultBackend"`
 		Backends         []Backend         `json:"backends"`
 		TaskRouting      map[string]string `json:"taskRouting"`
+		ModelTypeFallback     map[string]string `json:"modelTypeFallback"`
 		ModelTypeRouting map[string]string `json:"modelTypeRouting"`
 	}{
 		DefaultBackend:   c.DefaultBackend,
 		Backends:         c.Backends,
 		TaskRouting:      c.TaskRouting,
+		ModelTypeFallback: c.ModelTypeFallback,  // add this line
 		ModelTypeRouting: c.ModelTypeRouting,
 	}
 
@@ -233,49 +239,39 @@ func (c *Config) GetAllHealthStatus() map[string]BackendHealth {
 }
 
 // GetBackendsByType returns backends that handle the specified type
-func (c *Config) GetBackendsByType(typeName string) []Backend {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	// Check if this type has a specific routing in taskRouting
-	backendName, hasRouting := c.TaskRouting[typeName]
-
-	if hasRouting {
-		// Return the specific backend for this type
-		for _, backend := range c.Backends {
-			if backend.Name == backendName {
-				return []Backend{backend}
-			}
-		}
-	}
-
-	// No specific routing, return empty (type not supported)
-	return []Backend{}
-}
-
-// GetHealthyBackendsByType returns healthy backends that handle the specified type
 func (c *Config) GetHealthyBackendsByType(typeName string) []Backend {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+    c.mu.RLock()
+    defer c.mu.RUnlock()
 
-	// Check if this type has a specific routing in taskRouting
-	backendName, hasRouting := c.TaskRouting[typeName]
+    // helper: find a backend by name and return it if healthy
+    findHealthy := func(name string) *Backend {
+        for i, backend := range c.Backends {
+            if backend.Name == name {
+                if health, ok := c.Health[backend.Name]; ok && health.Status == HealthStatusHealthy {
+                    return &c.Backends[i]
+                }
+                return nil // found but unhealthy
+            }
+        }
+        return nil // not found
+    }
 
-	if hasRouting {
-		// Check if the specific backend is healthy
-		for _, backend := range c.Backends {
-			if backend.Name == backendName {
-				if health, ok := c.Health[backend.Name]; ok && health.Status == HealthStatusHealthy {
-					return []Backend{backend}
-				}
-				// Backend exists but is not healthy
-				return []Backend{}
-			}
-		}
-	}
+    if primaryName, hasRouting := c.TaskRouting[typeName]; hasRouting {
+        // Try primary backend first
+        if b := findHealthy(primaryName); b != nil {
+            return []Backend{*b}
+        }
+        // Primary unhealthy — try fallback if configured
+        if fallbackName, hasFallback := c.ModelTypeFallback[typeName]; hasFallback {
+            if b := findHealthy(fallbackName); b != nil {
+                return []Backend{*b}
+            }
+        }
+        // Both unhealthy
+        return []Backend{}
+    }
 
-	// No specific routing or backend not found
-	return []Backend{}
+    return []Backend{}
 }
 
 // GetAllTypes returns all unique types from taskRouting
@@ -320,12 +316,27 @@ func (c *Config) GetBackendByModelType(modelType string) *Backend {
 	defer c.mu.RUnlock()
 
 	if backendName, ok := c.ModelTypeRouting[modelType]; ok {
-		for _, backend := range c.Backends {
-			if backend.Name == backendName {
-				return &backend
-			}
-		}
-	}
+        for i, backend := range c.Backends {
+            if backend.Name == backendName {
+                // If healthy, use it
+                if health, ok := c.Health[backend.Name]; ok && health.Status == HealthStatusHealthy {
+                    return &c.Backends[i]
+                }
+                // Primary unhealthy — check fallback
+                if fallbackName, hasFallback := c.ModelTypeFallback[modelType]; hasFallback {
+                    for j, fb := range c.Backends {
+                        if fb.Name == fallbackName {
+                            if health, ok := c.Health[fb.Name]; ok && health.Status == HealthStatusHealthy {
+                                return &c.Backends[j]
+                            }
+                        }
+                    }
+                }
+                // Both unhealthy — return nil, let handler fall through to default
+                return nil
+            }
+        }
+    }
 
-	return nil
+    return nil
 }
