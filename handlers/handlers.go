@@ -173,28 +173,15 @@ func PredictHandler(c *gin.Context) {
 			if selectedBackend == nil {
 				// Check if this task has specific routing in taskRouting
 				healthyBackends := cfg.GetHealthyBackendsByType(t)
-				allBackends := cfg.GetBackendsByType(t)
 
-				if len(allBackends) > 0 {
-					// Use round-robin to select backend
+				if len(healthyBackends) > 0 {
 					var backendList []string
-					if len(healthyBackends) > 0 {
-						// Prefer healthy backends
-						for _, b := range healthyBackends {
-							backendList = append(backendList, b.URL)
-						}
-					} else {
-						// No healthy backends, use all backends
-						for _, b := range allBackends {
-							backendList = append(backendList, b.URL)
-						}
+					for _, b := range healthyBackends {
+						backendList = append(backendList, b.URL)
 					}
-
-					// Use round-robin to select backend
 					selectedURL := proxy.GetNextBackend(t, backendList)
 					if selectedURL != "" {
-						// Find backend by URL
-						for _, b := range allBackends {
+						for _, b := range healthyBackends {
 							if b.URL == selectedURL {
 								selectedBackend = &b
 								break
